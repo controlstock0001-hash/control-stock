@@ -246,6 +246,8 @@ async function flushOutbox() {
           await productsApi.delete(op.uid, op.payload.codigo);
         } else if (op.type === "sale") {
           await salesApi.commit(op.uid, op.payload.sale);
+        } else if (op.type === "revertSale") {
+          await salesApi.revert(op.uid, op.payload.sale);
         }
         await localDB.deleteFromOutbox(op.id);
       } catch (e) {
@@ -506,6 +508,33 @@ function roundToTen(n) {
   return Math.round(n / 10) * 10;
 }
 
+// ── Modal de confirmación propio (reemplaza a confirm() nativo) ──
+let confirmResolver = null;
+
+function showConfirm({ title = "¿Estás seguro?", message = "", confirmLabel = "Confirmar", danger = false } = {}) {
+  return new Promise((resolve) => {
+    confirmResolver = resolve;
+    $("#confirm-title").textContent = title;
+    $("#confirm-message").textContent = message;
+    const btn = $("#confirm-accept-btn");
+    btn.textContent = confirmLabel;
+    btn.classList.toggle("bg-red-600", danger);
+    btn.classList.toggle("hover:bg-red-700", danger);
+    btn.classList.toggle("bg-brand", !danger);
+    btn.classList.toggle("hover:bg-brand-dark", !danger);
+    openModal("confirm-modal");
+  });
+}
+
+function resolveConfirm(value) {
+  closeModal("confirm-modal");
+  if (confirmResolver) {
+    confirmResolver(value);
+    confirmResolver = null;
+  }
+}
+
+
 function confirmWeigh() {
   const prod = pendingWeighProduct;
   if (!prod) return;
@@ -663,6 +692,79 @@ function posClear() {
   $("#pos-cash").classList.add("hidden");
   renderPosMethods();
   renderCart();
+}
+
+function updateUndoButton() {
+  const btn = $("#pos-undo-btn");
+  if (!btn) return;
+  const last = todaySales[0];
+  btn.disabled = !last;
+  btn.title = last ? `Última: $${formatPrice(last.total || 0)}` : "";
+}
+
+async function undoLastSale() {
+  const sale = todaySales[0];
+  if (!sale) {
+    showToast("No hay ventas hoy para deshacer", "error");
+    return;
+  }
+  const metodoLabel = PAYMENT_METHODS.find((m) => m.id === sale.metodoPago)?.label || sale.metodoPago;
+  const ok = await showConfirm({
+    title: "Deshacer última venta",
+    message: `Se anulará la venta de $${formatPrice(sale.total || 0)} (${metodoLabel}) y se repondrá el stock.`,
+    confirmLabel: "Deshacer",
+    danger: true,
+  });
+  if (!ok) return;
+
+  // 1) Repone stock local (los pesables no llevan stock)
+  for (const it of sale.items || []) {
+    if (it.pesable) continue;
+    const idx = products.findIndex((p) => p.codigo === it.codigo);
+    if (idx >= 0) {
+      products[idx] = {
+        ...products[idx],
+        cantidad: (products[idx].cantidad ?? 0) + (it.cantidad || 0),
+      };
+      await localDB.putProduct(products[idx]);
+    }
+  }
+
+  // 2) Registra movimientos de entrada por la anulación
+  const now = Date.now();
+  for (const it of sale.items || []) {
+    const mov = {
+      codigo: it.pesable ? (it.codigoBase || it.codigo) : it.codigo,
+      nombre: `Anulación: ${it.nombre}`,
+      accion: "entrada",
+      cantidad: it.cantidad || 0,
+      ts: now,
+    };
+    todayMovements.unshift(mov);
+    await localDB.addMovement(mov);
+  }
+
+  // 3) Quita la venta del día (caché + IndexedDB)
+  todaySales = todaySales.filter((v) => v !== sale);
+  await localDB.replaceSales(todaySales);
+
+  // 4) Nube: si la venta aún no se subió, basta con sacarla de la cola;
+  //    si ya se subió, se encola la reversión.
+  const pending = await localDB.getOutbox();
+  const queued = pending.find(
+    (op) => op.type === "sale" && op.payload?.sale?.ts === sale.ts
+  );
+  if (queued) {
+    await localDB.deleteFromOutbox(queued.id);
+  } else {
+    await localDB.addToOutbox({ uid: currentUser.uid, type: "revertSale", payload: { sale } });
+    scheduleFlush();
+  }
+
+  renderInventory();
+  renderReports();
+  renderHistory(todayMovements);
+  showToast(`Venta de $${formatPrice(sale.total || 0)} anulada`, "success");
 }
 
 async function posCharge() {
@@ -919,7 +1021,13 @@ async function saveProduct(e) {
 
 async function deleteProduct() {
   if (!editingCode) return;
-  if (!confirm("¿Eliminar este producto del inventario?")) return;
+  const ok = await showConfirm({
+    title: "Eliminar producto",
+    message: "Se borrará del inventario en este dispositivo y en la nube. Esta acción no se puede deshacer.",
+    confirmLabel: "Eliminar",
+    danger: true,
+  });
+  if (!ok) return;
 
   const codigo = editingCode;
   products = products.filter((p) => p.codigo !== codigo);
@@ -1084,6 +1192,7 @@ function renderProductCard(p) {
 //  Render: Reportes
 // ============================================================
 function renderReports() {
+  updateUndoButton();
   // --- Ventas de hoy (caja) ---
   const salesTotal = todaySales.reduce((s, v) => s + (v.total || 0), 0);
   const salesCount = todaySales.length;
@@ -1699,6 +1808,13 @@ function bindEvents() {
   });
   $("#pos-charge-btn").addEventListener("click", posCharge);
   $("#pos-clear-btn").addEventListener("click", posClear);
+  $("#pos-undo-btn").addEventListener("click", undoLastSale);
+
+  // Modal de confirmación genérico
+  $("#confirm-accept-btn").addEventListener("click", () => resolveConfirm(true));
+  document.querySelectorAll("[data-confirm-cancel]").forEach((el) =>
+    el.addEventListener("click", () => resolveConfirm(false))
+  );
 
   // Modal de pesable: confirmar gramos
   $("#weigh-grams").addEventListener("input", () => {
