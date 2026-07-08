@@ -184,8 +184,36 @@ export const salesApi = {
       total: sale.total,
       metodoPago: sale.metodoPago,
       items: sale.items,
+      ts: sale.ts || Date.now(), // marca local: permite ubicar la venta al anularla
       fecha: serverTimestamp(),
     });
+  },
+
+  // Anula una venta ya subida: repone stock, registra movimientos de
+  // entrada y elimina el documento de la venta (ubicado por su ts local).
+  async revert(uid, sale) {
+    for (const it of sale.items || []) {
+      if (!it.pesable) {
+        await updateDoc(productDoc(uid, it.codigo), {
+          cantidad: increment(it.cantidad || 0),
+          actualizado: serverTimestamp(),
+        });
+      }
+      await addDoc(movementsCol(uid), {
+        codigo: it.pesable ? (it.codigoBase || it.codigo) : it.codigo,
+        nombre: `Anulación: ${it.nombre}`,
+        accion: "entrada",
+        cantidad: it.cantidad || 0,
+        fecha: serverTimestamp(),
+      });
+    }
+    if (sale.ts) {
+      const q = query(salesCol(uid), where("ts", "==", sale.ts));
+      const snap = await getDocs(q);
+      for (const d of snap.docs) {
+        await deleteDoc(doc(db, "usuarios", uid, "ventas", d.id));
+      }
+    }
   },
 
   async fetchToday(uid) {
@@ -204,7 +232,7 @@ export const salesApi = {
         total: data.total || 0,
         metodoPago: data.metodoPago || "otro",
         items: data.items || [],
-        ts: fecha.getTime(),
+        ts: data.ts || fecha.getTime(),
       };
     });
   },
@@ -224,7 +252,7 @@ export const salesApi = {
         total: data.total || 0,
         metodoPago: data.metodoPago || "otro",
         items: data.items || [],
-        ts: fecha.getTime(),
+        ts: data.ts || fecha.getTime(),
       };
     });
   },
