@@ -243,6 +243,11 @@
                   class="mt-2 w-full rounded-xl py-2.5 text-sm font-medium text-ink/50 transition hover:bg-paper">
                   Vaciar ticket
                 </button>
+                <button id="pos-undo-btn" disabled
+                  class="mt-2 flex w-full items-center justify-center gap-2 rounded-xl bg-white py-2.5 text-sm font-semibold text-ink transition active:scale-[0.98] hover:bg-paper disabled:opacity-40">
+                  <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>
+                  Deshacer última venta
+                </button>
               </div>
             </div>
           </div>
@@ -739,6 +744,25 @@
           <button id="weigh-confirm-btn" type="button"
             class="flex-1 rounded-xl bg-brand py-3 font-semibold text-white shadow-sm transition active:scale-[0.98] hover:bg-brand-dark">
             Agregar al ticket
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ MODAL: CONFIRMACIÓN GENÉRICA ============ -->
+    <div id="confirm-modal" class="modal hidden" style="z-index:60">
+      <div class="modal-backdrop" data-confirm-cancel></div>
+      <div class="modal-sheet text-center">
+        <h3 id="confirm-title" class="text-lg font-bold text-ink">¿Estás seguro?</h3>
+        <p id="confirm-message" class="mt-2 text-sm text-ink/60"></p>
+        <div class="mt-5 flex gap-3">
+          <button type="button" data-confirm-cancel
+            class="flex-1 rounded-xl bg-white py-3 font-semibold text-ink/60 transition hover:bg-paper">
+            Cancelar
+          </button>
+          <button id="confirm-accept-btn" type="button"
+            class="flex-1 rounded-xl bg-brand py-3 font-semibold text-white shadow-sm transition active:scale-[0.98] hover:bg-brand-dark">
+            Confirmar
           </button>
         </div>
       </div>
