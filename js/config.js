@@ -14,13 +14,13 @@
 // ============================================================
 
 export const firebaseConfig = {
-  apiKey: "AIzaSyCB6mlKoTX_yQRko2B4MDq99lhcHtTn_Ig",
-  authDomain: "stock-celular.firebaseapp.com",
-  projectId: "stock-celular",
-  storageBucket: "stock-celular.firebasestorage.app",
-  messagingSenderId: "953647568198",
-  appId: "1:953647568198:web:71fea72d12438c426f4147",
-  measurementId: "G-XDP68C8XS2"
+  apiKey: "AIzaSyDo1iJYaCdVWW0KECw8huW-gwUYuhuUCXw",
+  authDomain: "control-stock-22b5c.firebaseapp.com",
+  projectId: "control-stock-22b5c",
+  storageBucket: "control-stock-22b5c.firebasestorage.app",
+  messagingSenderId: "195154535336",
+  appId: "1:195154535336:web:4b624fad11f1c3b3acf39d",
+  measurementId: "G-M468JHX620"
 };
 
 // No edites esto: detecta si todavía faltan las credenciales.
