@@ -50,12 +50,16 @@ const PAYMENT_METHODS = [
   { id: "credito", label: "Crédito" },
   { id: "transferencia", label: "Transferencia" },
   { id: "qr", label: "QR / Billetera" },
+  { id: "fiado", label: "Fiado" },
 ];
 
 const scanner = new BarcodeScanner({ onScan: (code) => handleScannedCode(code) });
 
 // Se cargan dinámicamente solo si Firebase está configurado
-let authApi, usersApi, productsApi, movementsApi, salesApi, isQuotaError;
+let authApi, usersApi, productsApi, movementsApi, salesApi, fiadoresApi, abonosApi, isQuotaError;
+let todayAbonos = []; // abonos (pagos de fiados) del día
+let fiadores = [];    // personas registradas para fiar
+let posFiado = null;  // { id, nombre } elegido para el ticket actual
 let unsubscribeProducts = null; // cancela el listener de tiempo real al cerrar sesión
 
 // ============================================================
@@ -76,6 +80,8 @@ async function init() {
   productsApi = fb.productsApi;
   movementsApi = fb.movementsApi;
   salesApi = fb.salesApi;
+  fiadoresApi = fb.fiadoresApi;
+  abonosApi = fb.abonosApi;
   isQuotaError = fb.isQuotaError;
 
   bindEvents();
@@ -200,6 +206,8 @@ async function ensureDailySync() {
   products = await localDB.getAllProducts();
   todayMovements = await localDB.getTodayMovements();
   todaySales = await localDB.getTodaySales();
+  fiadores = await localDB.getFiadores();
+  todayAbonos = await localDB.getTodayAbonos();
 
   // Descarga movimientos y ventas solo si es un día nuevo
   const meta = await localDB.getMeta();
@@ -209,10 +217,16 @@ async function ensureDailySync() {
     try {
       const movs = await movementsApi.fetchToday(currentUser.uid);
       const sales = await salesApi.fetchToday(currentUser.uid);
+      const people = await fiadoresApi.fetchAll(currentUser.uid);
+      const abonos = await abonosApi.fetchToday(currentUser.uid);
       await localDB.replaceMovements(movs);
       await localDB.replaceSales(sales);
+      await localDB.replaceFiadores(people);
+      await localDB.replaceAbonos(abonos);
       todayMovements = movs;
       todaySales = sales;
+      fiadores = people;
+      todayAbonos = abonos;
     } catch (e) {
       if (isQuotaError && isQuotaError(e)) showQuotaBanner();
       else console.log("[v0] Descarga fallida, uso datos locales:", e?.message || e);
@@ -227,11 +241,13 @@ async function ensureDailySync() {
 // Semáforo: si ya hay un flush corriendo, espera a que termine y sale.
 async function flushOutbox() {
   if (flushing) return false; // ya hay uno en curso; el outbox se procesa solo
+  const uid = currentUser?.uid;
+  if (!uid) return false; // sesión cerrada mientras corría el debounce (logout)
   flushing = true;
   try {
     const ops = await localDB.getOutbox();
     for (const op of ops) {
-      if (op.uid !== currentUser.uid) continue; // ops de otro usuario: se respetan
+      if (op.uid !== uid) continue; // ops de otro usuario: se respetan
       try {
         if (op.type === "adjust") {
           await productsApi.adjustStock(
@@ -249,7 +265,17 @@ async function flushOutbox() {
         } else if (op.type === "revertSale") {
           await salesApi.revert(op.uid, op.payload.sale);
         } else if (op.type === "updateSale") {
-          await salesApi.update(op.uid, op.payload.sale, op.payload.deltas || []);
+          await salesApi.update(op.uid, op.payload.sale, op.payload.deltas || [], op.payload.fiadoDelta || null);
+        } else if (op.type === "fiador") {
+          await fiadoresApi.save(op.uid, op.payload.fiador);
+        } else if (op.type === "abono") {
+          await abonosApi.commit(op.uid, op.payload.abono);
+        } else if (op.type === "abonoRevert") {
+          await abonosApi.revert(op.uid, op.payload.abono);
+        } else if (op.type === "fiadorSaldo") {
+          await fiadoresApi.setSaldo(op.uid, op.payload.id, op.payload.saldo, op.payload.ts);
+        } else if (op.type === "fiadorCupo") {
+          await fiadoresApi.setCupo(op.uid, op.payload.id, op.payload.cupo);
         }
         await localDB.deleteFromOutbox(op.id);
       } catch (e) {
@@ -337,6 +363,7 @@ function switchTab(tabId) {
 
   if (tabId === "tab-reports") renderReports();
   if (tabId === "tab-sales") renderSales();
+  if (tabId === "tab-fiados") renderFiadosPeople();
   if (tabId === "tab-scan") focusScanInput();
   if (tabId === "tab-pos") focusPosInput();
   if (tabId === "tab-stats") renderStats();
@@ -459,17 +486,75 @@ function posAddByCode(code) {
   renderCart();
 }
 
+// ============================================================
+//  Ranking de búsqueda de productos
+//  Orden: 1) nombre empieza con el término, 2) alguna palabra
+//  del nombre empieza con él, 3) el nombre lo contiene,
+//  4) solo el código lo contiene. Desempate: posición del match
+//  y luego alfabético.
+// ============================================================
+function normSearch(s) {
+  return (s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, ""); // sin acentos: "café" ↔ "cafe"
+}
+
+function rankProducts(term, list) {
+  const t = normSearch(term);
+  if (!t) return [];
+  const scored = [];
+  for (const p of list) {
+    const nombre = normSearch(p.nombre);
+    const codigo = (p.codigo || "").toLowerCase();
+    let score;
+    if (nombre.startsWith(t)) score = 0;
+    else if (nombre.split(/\s+/).some((w) => w.startsWith(t))) score = 1;
+    else if (nombre.includes(t)) score = 2;
+    else if (codigo.includes(t)) score = 3;
+    else continue;
+    scored.push({ p, score, pos: nombre.indexOf(t) === -1 ? 999 : nombre.indexOf(t) });
+  }
+  scored.sort(
+    (a, b) =>
+      a.score - b.score ||
+      a.pos - b.pos ||
+      normSearch(a.p.nombre).localeCompare(normSearch(b.p.nombre), "es")
+  );
+  return scored.map((s) => s.p);
+}
+
+// ── Navegación con teclado en listas de resultados ──────────
+// Mantiene el índice resaltado y devuelve el elemento elegido con Enter.
+function moveListSelection(listEl, itemSelector, index, dir) {
+  const items = [...listEl.querySelectorAll(itemSelector)];
+  if (!items.length) return -1;
+  let i = index + dir;
+  if (i < 0) i = items.length - 1;
+  if (i >= items.length) i = 0;
+  items.forEach((el, k) => {
+    el.classList.toggle("kb-selected", k === i);
+  });
+  items[i].scrollIntoView({ block: "nearest" });
+  return i;
+}
+
+function clearListSelection(listEl, itemSelector) {
+  listEl.querySelectorAll(itemSelector).forEach((el) => {
+    el.classList.remove("kb-selected");
+  });
+}
+
 // ── Búsqueda por nombre en la caja ──────────────────────────
 let posSearchTimeout = null;
+let posSearchIndex = -1; // ítem resaltado con las flechas (-1 = ninguno)
 function posPendingSearch(term) {
   clearTimeout(posSearchTimeout);
   const results = $("#pos-search-results");
-  if (!term || term.length < 2) { results.classList.add("hidden"); return; }
+  if (!term || term.length < 2) { results.classList.add("hidden"); posSearchIndex = -1; return; }
   posSearchTimeout = setTimeout(() => {
-    const t = term.toLowerCase();
-    const matches = products
-      .filter((p) => (p.nombre || "").toLowerCase().includes(t))
-      .slice(0, 8);
+    const matches = rankProducts(term, products).slice(0, 8);
+    posSearchIndex = -1; // el texto cambió: se pierde la selección de flechas
     if (!matches.length) { results.classList.add("hidden"); return; }
     results.innerHTML = matches.map((p) => `
       <li data-code="${escapeAttr(p.codigo)}"
@@ -654,9 +739,136 @@ function renderPosMethods() {
 }
 
 function posSetMethod(id) {
+  if (id === "fiado") {
+    // Primero se elige (o crea) la persona; el método queda fijado al confirmar.
+    openFiadoModal();
+    return;
+  }
   posMethod = id;
+  posFiado = null;
+  updateFiadoChip();
   renderPosMethods();
   $("#pos-cash").classList.toggle("hidden", id !== "efectivo");
+  posUpdateCash();
+  updateChargeButton();
+}
+
+function updateFiadoChip() {
+  const chip = $("#pos-fiado-chip");
+  if (!chip) return;
+  if (posFiado) {
+    const f = fiadores.find((x) => x.id === posFiado.id) || posFiado;
+    const disp = cupoDisponible(f);
+    chip.textContent =
+      disp == null
+        ? `Fiado a: ${posFiado.nombre}`
+        : `Fiado a: ${posFiado.nombre} · cupo disp. $${formatPrice(Math.max(0, disp))}`;
+    chip.classList.remove("hidden");
+    chip.classList.add("flex");
+  } else {
+    chip.classList.add("hidden");
+    chip.classList.remove("flex");
+  }
+}
+
+// ── Fiado: elegir o crear persona ──
+// La unicidad se garantiza normalizando el nombre a un id (minúsculas,
+// sin tildes, espacios colapsados): dos nombres "iguales" generan el mismo id.
+function normalizeFiadoName(nombre) {
+  return nombre
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function openFiadoModal() {
+  $("#fiado-search").value = "";
+  renderFiadoMatches("");
+  openModal("fiado-modal");
+  setTimeout(() => $("#fiado-search").focus(), 50);
+}
+
+function renderFiadoMatches(term) {
+  const norm = normalizeFiadoName(term || "");
+  const list = $("#fiado-matches");
+  const matches = fiadores
+    .filter((f) => !norm || f.id.includes(norm))
+    .slice(0, 20);
+
+  list.innerHTML = matches
+    .map(
+      (f) => `
+      <li>
+        <button data-fiado-id="${f.id}" class="flex w-full items-center gap-2 rounded-xl border border-ink/10 bg-paper px-3 py-2.5 text-left text-sm font-semibold text-ink transition active:scale-[0.99] hover:border-ink/30">
+          <svg class="h-4 w-4 shrink-0 text-ink/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          ${escapeHtml(f.nombre)}
+        </button>
+      </li>`
+    )
+    .join("");
+  list.querySelectorAll("[data-fiado-id]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const f = fiadores.find((x) => x.id === el.dataset.fiadoId);
+      if (f) selectFiado(f);
+    })
+  );
+
+  // Botón "crear": solo si hay texto y no existe ese nombre exacto
+  const createBtn = $("#fiado-create-btn");
+  const nombre = (term || "").trim().replace(/\s+/g, " ");
+  const exists = norm && fiadores.some((f) => f.id === norm);
+  if (nombre.length >= 2 && !exists) {
+    createBtn.textContent = `+ Crear «${nombre}»`;
+    createBtn.classList.remove("hidden");
+    createBtn.classList.add("flex");
+  } else {
+    createBtn.classList.add("hidden");
+    createBtn.classList.remove("flex");
+  }
+}
+
+// Registra una persona nueva (nombre único). Devuelve el fiador o null.
+async function registerFiador(nombreCrudo) {
+  const nombre = (nombreCrudo || "").trim().replace(/\s+/g, " ");
+  if (nombre.length < 2) { showToast("Ingresá un nombre válido", "error"); return null; }
+  const id = normalizeFiadoName(nombre);
+  if (fiadores.some((f) => f.id === id)) {
+    showToast("Esa persona ya está registrada", "error");
+    return null;
+  }
+  const fiador = { id, nombre, saldo: 0, ultimoMovimiento: null };
+  fiadores.push(fiador);
+  fiadores.sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
+  await localDB.putFiador(fiador);
+  await localDB.addToOutbox({ uid: currentUser.uid, type: "fiador", payload: { fiador } });
+  scheduleFlush();
+  showToast(`${nombre} registrado`, "success");
+  return fiador;
+}
+
+// Crear desde la caja: registra y lo deja elegido para el ticket
+async function createFiado() {
+  const fiador = await registerFiador($("#fiado-search").value);
+  if (fiador) selectFiado(fiador);
+}
+
+function selectFiado(fiador) {
+  posFiado = fiador;
+  posMethod = "fiado";
+  closeModal("fiado-modal");
+  updateFiadoChip();
+
+  // Aviso inmediato de cupo (el bloqueo duro está en el cobro)
+  const disp = cupoDisponible(fiador);
+  if (disp != null && disp <= 0) {
+    showToast(`${fiador.nombre} tiene el cupo agotado ($${formatPrice(cupoOf(fiador))}). Debe abonar antes de fiar.`, "error");
+  } else if (disp != null) {
+    showToast(`A ${fiador.nombre} le quedan $${formatPrice(disp)} de cupo`, "info");
+  }
+  renderPosMethods();
+  $("#pos-cash").classList.add("hidden");
   posUpdateCash();
   updateChargeButton();
 }
@@ -690,6 +902,8 @@ function updateChargeButton() {
 function posClear() {
   cart = [];
   posMethod = null;
+  posFiado = null;
+  updateFiadoChip();
   const cash = $("#pos-cash-given");
   if (cash) cash.value = "";
   $("#pos-cash").classList.add("hidden");
@@ -781,6 +995,8 @@ async function annulSale(sale) {
     scheduleFlush();
   }
 
+  if (sale.fiadoId) await applyFiadoDeltaLocal(sale.fiadoId, -(sale.total || 0));
+
   renderInventory();
   renderReports();
   renderSales();
@@ -837,7 +1053,8 @@ function displaySales(sales, editable) {
   list.innerHTML = sales
     .map((v, i) => {
       const hora = new Date(v.ts || Date.now()).toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" });
-      const metodo = PAYMENT_METHODS.find((m) => m.id === v.metodoPago)?.label || v.metodoPago || "—";
+      let metodo = PAYMENT_METHODS.find((m) => m.id === v.metodoPago)?.label || v.metodoPago || "—";
+      if (v.metodoPago === "fiado" && v.fiadoNombre) metodo = `Fiado (${escapeHtml(v.fiadoNombre)})`;
       const nItems = (v.items || []).reduce((s, it) => s + (it.cantidad || 1), 0);
       const detalle = (v.items || []).map((it) => it.nombre).join(", ");
       const inner = `
@@ -866,6 +1083,772 @@ function displaySales(sales, editable) {
       el.addEventListener("click", () => openSaleEdit(todaySales[parseInt(el.dataset.saleIdx, 10)]))
     );
   }
+}
+
+// ════════════════ MÓDULO: FIADOS (cuentas por persona) ════════════════
+let selectedFiado = null;
+
+function renderFiadosPeople() {
+  const listEl = $("#fiados-people");
+  if (!listEl) return;
+  const raw = $("#fiados-search").value || "";
+  const term = normalizeFiadoName(raw);
+  const matches = fiadores.filter((f) => !term || f.id.includes(term));
+
+  // Crear persona directamente desde el cuaderno
+  const createBtn = $("#fiados-create-btn");
+  const nombre = raw.trim().replace(/\s+/g, " ");
+  const exists = term && fiadores.some((f) => f.id === term);
+  if (nombre.length >= 2 && !exists) {
+    createBtn.textContent = `+ Crear «${nombre}»`;
+    createBtn.classList.remove("hidden");
+    createBtn.classList.add("flex");
+  } else {
+    createBtn.classList.add("hidden");
+    createBtn.classList.remove("flex");
+  }
+
+  $("#fiados-people-empty").classList.toggle("hidden", fiadores.length > 0 || nombre.length >= 2);
+  listEl.innerHTML = matches
+    .map((f) => {
+      const active = selectedFiado?.id === f.id;
+      let chip = "";
+      if (f.saldo == null) {
+        chip = `<span class="shrink-0 text-xs ${active ? "text-white/40" : "text-ink/30"}">—</span>`;
+      } else if (f.saldo > 0) {
+        const disp = cupoDisponible(f);
+        const tope = disp != null && disp <= 0
+          ? `<span class="mr-1 shrink-0 rounded-full ${active ? "bg-white text-ink" : "bg-red-600 text-white"} px-2 py-0.5 text-[10px] font-bold uppercase">Tope</span>`
+          : "";
+        chip = `${tope}<span class="shrink-0 text-sm font-bold ${active ? "text-white" : "text-ink"}">$${formatPrice(f.saldo)}</span>`;
+      } else if (f.saldo < 0) {
+        chip = `<span class="shrink-0 rounded-full ${active ? "bg-white/15 text-white" : "bg-ink/10 text-ink/70"} px-2 py-0.5 text-[11px] font-semibold">A favor $${formatPrice(Math.abs(f.saldo))}</span>`;
+      } else {
+        chip = `<span class="shrink-0 rounded-full ${active ? "bg-white/15 text-white" : "bg-ink/10 text-ink/60"} px-2 py-0.5 text-[11px] font-semibold">Al día ✓</span>`;
+      }
+      return `
+      <li>
+        <button data-fiados-person="${f.id}" class="flex w-full items-center gap-3 rounded-2xl border p-3 text-left transition active:scale-[0.99] ${active ? "border-ink bg-ink text-white" : "border-ink/10 bg-paper text-ink hover:border-ink/30"}">
+          <svg class="h-4 w-4 shrink-0 ${active ? "text-white/70" : "text-ink/40"}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          <span class="min-w-0 flex-1 truncate text-sm font-semibold">${escapeHtml(f.nombre)}</span>
+          ${chip}
+        </button>
+      </li>`;
+    })
+    .join("");
+  listEl.querySelectorAll("[data-fiados-person]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const f = fiadores.find((x) => x.id === el.dataset.fiadosPerson);
+      if (f) openFiadoDetail(f);
+    })
+  );
+}
+
+let selectedFiadoSaldo = 0; // deuda pendiente de la persona seleccionada
+
+// Espejo local del increment de la nube: mantiene el saldo del fiador
+// al día en este dispositivo sin releer el historial.
+async function applyFiadoDeltaLocal(fiadoId, delta, ts) {
+  if (!fiadoId || !delta) return;
+  const f = fiadores.find((x) => x.id === fiadoId);
+  if (!f) return;
+  f.saldo = (f.saldo ?? 0) + delta;
+  f.ultimoMovimiento = ts || Date.now();
+  await localDB.putFiador(f);
+  if (selectedFiado?.id === fiadoId) {
+    selectedFiadoSaldo = f.saldo;
+    renderSaldoBox(f.saldo);
+    $("#fiados-pay-btn").disabled = f.saldo <= 0;
+  }
+  renderFiadosPeople();
+  renderReports();
+  renderCupoBox();
+}
+
+// ============================================================
+//  Cupo de crédito (límite de fiado por persona)
+// ============================================================
+// cupo definido = número > 0. null/0/ausente = sin límite.
+function cupoOf(fiador) {
+  const c = fiador?.cupo;
+  return typeof c === "number" && c > 0 ? c : null;
+}
+
+// Disponible = cupo − deuda actual (puede ser negativo si ya lo excedió,
+// p. ej. si el cupo se fijó después de acumular deuda).
+function cupoDisponible(fiador) {
+  const cupo = cupoOf(fiador);
+  if (cupo == null) return null;
+  return cupo - Math.max(0, fiador.saldo ?? 0);
+}
+
+// Valida si se le puede fiar `monto` más. Devuelve null si pasa,
+// o el mensaje de error a mostrar si no.
+function cupoError(fiador, monto) {
+  const disp = cupoDisponible(fiador);
+  if (disp == null) return null; // sin límite
+  if (monto <= disp) return null;
+  if (disp <= 0) {
+    return `${fiador.nombre} llegó a su cupo de $${formatPrice(cupoOf(fiador))}. Debe abonar antes de fiar de nuevo.`;
+  }
+  return `Supera el cupo de ${fiador.nombre}: le quedan $${formatPrice(disp)} disponibles (cupo $${formatPrice(cupoOf(fiador))}).`;
+}
+
+// Pinta la caja de cupo en el detalle del fiador seleccionado.
+function renderCupoBox() {
+  const f = selectedFiado ? fiadores.find((x) => x.id === selectedFiado.id) : null;
+  const textEl = $("#fiados-cupo-text");
+  if (!textEl || !f) return;
+  const cupo = cupoOf(f);
+  const barWrap = $("#fiados-cupo-bar-wrap");
+  if (cupo == null) {
+    textEl.textContent = "Sin límite";
+    barWrap.classList.add("hidden");
+    return;
+  }
+  const deuda = Math.max(0, f.saldo ?? 0);
+  const disp = cupo - deuda;
+  const pct = Math.min(100, Math.round((deuda / cupo) * 100));
+  textEl.textContent = `$${formatPrice(cupo)}`;
+  barWrap.classList.remove("hidden");
+  const bar = $("#fiados-cupo-bar");
+  bar.style.width = `${pct}%`;
+  bar.className = `h-full rounded-full transition-all ${disp <= 0 ? "bg-red-600" : pct >= 80 ? "bg-yellow-500" : "bg-ink"}`;
+  $("#fiados-cupo-disp").textContent =
+    disp <= 0
+      ? `Cupo agotado — excedido en $${formatPrice(Math.abs(disp))}`
+      : `Disponible: $${formatPrice(disp)} (usado ${pct}%)`;
+}
+
+// ── Modal de edición de cupo ──
+function openCupoModal() {
+  if (!selectedFiado) return;
+  const f = fiadores.find((x) => x.id === selectedFiado.id) || selectedFiado;
+  $("#cupo-person").textContent = `Límite de fiado para ${f.nombre}`;
+  const cupo = cupoOf(f);
+  $("#cupo-monto").value = cupo ?? "";
+  $("#cupo-remove-btn").classList.toggle("hidden", cupo == null);
+  openModal("cupo-modal");
+  setTimeout(() => $("#cupo-monto").focus(), 50);
+}
+
+async function saveCupo(remove = false) {
+  if (!selectedFiado) return;
+  const f = fiadores.find((x) => x.id === selectedFiado.id);
+  if (!f) return;
+
+  let cupo = null;
+  if (!remove) {
+    const val = parseFloat($("#cupo-monto").value);
+    cupo = Number.isFinite(val) && val > 0 ? Math.round(val) : null;
+  }
+
+  f.cupo = cupo;
+  await localDB.putFiador(f);
+  await localDB.addToOutbox({
+    uid: currentUser.uid,
+    type: "fiadorCupo",
+    payload: { id: f.id, cupo },
+  });
+  scheduleFlush();
+
+  closeModal("cupo-modal");
+  renderCupoBox();
+  renderFiadosPeople();
+  showToast(
+    cupo == null
+      ? `${f.nombre} quedó sin límite de fiado`
+      : `Cupo de $${formatPrice(cupo)} fijado para ${f.nombre}`,
+    "success"
+  );
+}
+
+// Caja "Debe / A favor" del detalle (el saldo puede quedar negativo si se
+// anula una compra ya pagada: eso es plata a favor del cliente).
+function renderSaldoBox(saldo) {
+  const label = $("#fiados-balance-label");
+  const value = $("#fiados-person-balance");
+  if (saldo < 0) {
+    if (label) label.textContent = "A favor";
+    value.textContent = "$" + formatPrice(Math.abs(saldo));
+  } else {
+    if (label) label.textContent = "Debe";
+    value.textContent = "$" + formatPrice(saldo);
+  }
+}
+
+// ── Eliminar fiador y todo su historial (requiere conexión) ──
+async function deleteFiador() {
+  const fiador = selectedFiado;
+  if (!fiador) return;
+
+  const saldoTxt =
+    (fiador.saldo ?? 0) > 0
+      ? ` OJO: todavía debe $${formatPrice(fiador.saldo)}.`
+      : "";
+  const ok = await showConfirm({
+    title: `Eliminar a ${fiador.nombre}`,
+    message:
+      "Se borrará la persona y TODO su historial: compras fiadas y abonos, también de los reportes de días anteriores. " +
+      "No repone stock. Esta acción no se puede deshacer." + saldoTxt,
+    confirmLabel: "Eliminar todo",
+    danger: true,
+  });
+  if (!ok) return;
+
+  // Requiere conexión: el borrado en la nube debe completarse primero
+  // para no dejar historial huérfano.
+  showToast("Eliminando historial…", "success");
+  try {
+    await fiadoresApi.deleteWithHistory(currentUser.uid, fiador.id);
+  } catch (e) {
+    if (isQuotaError && isQuotaError(e)) showQuotaBanner();
+    showToast("No se pudo eliminar. Revisá tu conexión e intentá de nuevo.", "error");
+    return;
+  }
+
+  // Limpieza local: persona, ventas y abonos de hoy, y operaciones en cola
+  fiadores = fiadores.filter((f) => f.id !== fiador.id);
+  await localDB.replaceFiadores(fiadores);
+
+  todaySales = todaySales.filter((v) => v.fiadoId !== fiador.id);
+  await localDB.replaceSales(todaySales);
+
+  todayAbonos = todayAbonos.filter((a) => a.fiadoId !== fiador.id);
+  await localDB.replaceAbonos(todayAbonos);
+
+  const pending = await localDB.getOutbox();
+  for (const op of pending) {
+    const opFiadoId =
+      op.payload?.fiador?.id ||
+      op.payload?.abono?.fiadoId ||
+      op.payload?.sale?.fiadoId ||
+      (op.type === "fiadorSaldo" ? op.payload?.id : null) ||
+      op.payload?.fiadoDelta?.fiadoId ||
+      null;
+    if (opFiadoId === fiador.id) await localDB.deleteFromOutbox(op.id);
+  }
+
+  selectedFiado = null;
+  selectedFiadoSaldo = 0;
+  $("#fiados-detail").classList.add("hidden");
+  renderFiadosPeople();
+  renderReports();
+  renderSales();
+  showToast(`${fiador.nombre} y su historial fueron eliminados`, "success");
+}
+
+async function openFiadoDetail(fiador) {
+  selectedFiado = fiador;
+  renderFiadosPeople();
+  const detail = $("#fiados-detail");
+  detail.classList.remove("hidden");
+  $("#fiados-person-name").textContent = fiador.nombre;
+  $("#fiados-purchases").innerHTML = "";
+  $("#fiados-purchases-empty").classList.add("hidden");
+  $("#fiados-history-btn").classList.add("hidden");
+
+  // Migración: fiadores creados antes del saldo persistido no lo tienen.
+  // Una única vez se lee el historial completo, se calcula y se guarda;
+  // desde ahí todo es incremental (increment atómico en cada operación).
+  if (fiador.saldo == null) {
+    $("#fiados-person-count").textContent = "Calculando saldo (primera vez)…";
+    $("#fiados-person-total").textContent = "$…";
+    $("#fiados-person-paid").textContent = "$…";
+    $("#fiados-person-balance").textContent = "$…";
+    $("#fiados-pay-btn").disabled = true;
+    try {
+      const { purchases, abonos } = await fetchFiadoHistory(fiador);
+      const fiadoTotal = purchases.reduce((sum, v) => sum + (v.total || 0), 0);
+      const abonadoTotal = abonos.reduce((sum, a) => sum + (a.monto || 0), 0);
+      const saldo = fiadoTotal - abonadoTotal;
+      const lastTs = Math.max(0, ...purchases.map((v) => v.ts || 0), ...abonos.map((a) => a.ts || 0));
+      fiador.saldo = saldo;
+      fiador.ultimoMovimiento = lastTs || Date.now();
+      await localDB.putFiador(fiador);
+      await localDB.addToOutbox({
+        uid: currentUser.uid,
+        type: "fiadorSaldo",
+        payload: { id: fiador.id, saldo, ts: fiador.ultimoMovimiento },
+      });
+      scheduleFlush();
+      renderFiadosPeople();
+      renderReports();
+      renderFiadoAccount(purchases, abonos, true);
+    } catch (e) {
+      if (isQuotaError && isQuotaError(e)) showQuotaBanner();
+      $("#fiados-person-count").textContent = "Sin conexión: no se pudo calcular el saldo.";
+    }
+    return;
+  }
+
+  // Saldo persistido: render instantáneo, sin leer historial.
+  selectedFiadoSaldo = fiador.saldo;
+  renderSaldoBox(fiador.saldo);
+  $("#fiados-person-total").textContent = "—";
+  $("#fiados-person-paid").textContent = "—";
+  $("#fiados-pay-btn").disabled = fiador.saldo <= 0;
+  const ult = fiador.ultimoMovimiento
+    ? new Date(fiador.ultimoMovimiento).toLocaleDateString("es", { day: "2-digit", month: "2-digit", year: "2-digit" })
+    : "—";
+  $("#fiados-person-count").textContent = `Último movimiento: ${ult}`;
+  renderCupoBox();
+
+  // Movimientos de hoy (locales, gratis); el resto se carga a pedido.
+  const todayPurchases = todaySales.filter(
+    (v) => v.metodoPago === "fiado" && v.fiadoId === fiador.id
+  );
+  const todayFiadoAbonos = todayAbonos.filter((a) => a.fiadoId === fiador.id);
+  renderFiadoTimeline(todayPurchases, todayFiadoAbonos, false);
+  $("#fiados-history-btn").classList.remove("hidden");
+}
+
+// Historial completo (nube + hoy local sin duplicar)
+async function fetchFiadoHistory(fiador) {
+  const localSalesToday = todaySales.filter(
+    (v) => v.metodoPago === "fiado" && v.fiadoId === fiador.id
+  );
+  const localAbonosToday = todayAbonos.filter((a) => a.fiadoId === fiador.id);
+  const [cloudSales, cloudAbonos] = await Promise.all([
+    salesApi.fetchByFiado(currentUser.uid, fiador.id),
+    abonosApi.fetchByFiado(currentUser.uid, fiador.id),
+  ]);
+  const salesTs = new Set(cloudSales.map((v) => v.ts));
+  const abonosTs = new Set(cloudAbonos.map((a) => a.ts));
+  return {
+    purchases: [...localSalesToday.filter((v) => !salesTs.has(v.ts)), ...cloudSales],
+    abonos: [...localAbonosToday.filter((a) => !abonosTs.has(a.ts)), ...cloudAbonos],
+  };
+}
+
+async function loadFullFiadoHistory() {
+  if (!selectedFiado) return;
+  const btn = $("#fiados-history-btn");
+  btn.disabled = true;
+  btn.textContent = "Cargando historial…";
+  try {
+    const { purchases, abonos } = await fetchFiadoHistory(selectedFiado);
+    renderFiadoAccount(purchases, abonos, true);
+    btn.classList.add("hidden");
+  } catch (e) {
+    if (isQuotaError && isQuotaError(e)) showQuotaBanner();
+    showToast("No se pudo cargar el historial. Revisá tu conexión.", "error");
+  }
+  btn.disabled = false;
+  btn.textContent = "Ver historial completo";
+}
+
+// Render con historial completo: totales de fiado/abonado + línea de tiempo
+function renderFiadoAccount(purchases, abonos, full) {
+  const fiadoTotal = purchases.reduce((sum, v) => sum + (v.total || 0), 0);
+  const abonadoTotal = abonos.reduce((sum, a) => sum + (a.monto || 0), 0);
+  $("#fiados-person-total").textContent = "$" + formatPrice(fiadoTotal);
+  $("#fiados-person-paid").textContent = "$" + formatPrice(abonadoTotal);
+
+  const f = fiadores.find((x) => x.id === selectedFiado?.id);
+  const saldo = f?.saldo ?? fiadoTotal - abonadoTotal;
+  selectedFiadoSaldo = saldo;
+  renderSaldoBox(saldo);
+  $("#fiados-pay-btn").disabled = saldo <= 0;
+  $("#fiados-person-count").textContent =
+    `${purchases.length} ${purchases.length === 1 ? "compra" : "compras"} · ` +
+    `${abonos.length} ${abonos.length === 1 ? "abono" : "abonos"}` +
+    (saldo === 0 && fiadoTotal > 0 ? " · Al día ✓" : saldo < 0 ? " · Saldo a favor" : "");
+
+  renderFiadoTimeline(purchases, abonos, full);
+}
+
+function renderFiadoTimeline(purchases, abonos, full) {
+  const timeline = [
+    ...purchases.map((v) => ({ tipo: "compra", ts: v.ts || 0, data: v })),
+    ...abonos.map((a) => ({ tipo: "abono", ts: a.ts || 0, data: a })),
+  ].sort((a, b) => b.ts - a.ts);
+
+  const emptyEl = $("#fiados-purchases-empty");
+  emptyEl.textContent = full
+    ? "Esta persona no tiene movimientos."
+    : "Sin movimientos hoy. Toca «Ver historial completo» para ver los anteriores.";
+  emptyEl.classList.toggle("hidden", timeline.length > 0);
+
+  const hoy = todayISO();
+  $("#fiados-purchases").innerHTML = timeline
+    .map((entry) => {
+      const d = new Date(entry.ts || Date.now());
+      const fecha = d.toLocaleDateString("es", { day: "2-digit", month: "2-digit", year: "2-digit" });
+      const hora = d.toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" });
+
+      if (entry.tipo === "abono") {
+        const a = entry.data;
+        const metodo = PAYMENT_METHODS.find((m) => m.id === a.metodoPago)?.label || a.metodoPago;
+        const esDeHoy =
+          `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}` === hoy;
+        return `
+      <li class="rounded-2xl border border-ink bg-ink p-3 text-white">
+        <div class="flex items-center justify-between">
+          <p class="text-sm font-semibold">
+            <svg class="mr-1 inline h-3.5 w-3.5 -translate-y-px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+            Abono · ${fecha} · ${hora}
+          </p>
+          <span class="text-lg font-bold">−$${formatPrice(a.monto || 0)}</span>
+        </div>
+        <div class="mt-0.5 flex items-center justify-between">
+          <p class="text-xs text-white/50">Pagado con ${metodo}</p>
+          ${esDeHoy ? `<button data-annul-abono="${a.ts}" class="rounded-lg px-2 py-1 text-xs font-semibold text-white/60 transition hover:bg-white/10 hover:text-white">Anular</button>` : ""}
+        </div>
+      </li>`;
+      }
+
+      const v = entry.data;
+      const lineas = (v.items || [])
+        .map((it) => {
+          const cant = it.cantidad > 1 ? `${it.cantidad} × ` : "";
+          const sub = (it.precio || 0) * (it.cantidad || 1);
+          return `<li class="flex items-baseline justify-between gap-2 text-xs text-ink/60">
+                    <span class="truncate">${cant}${escapeHtml(it.nombre)}</span>
+                    <span class="shrink-0 font-semibold text-ink/80">$${formatPrice(sub)}</span>
+                  </li>`;
+        })
+        .join("");
+      return `
+      <li class="rounded-2xl border border-ink/10 bg-paper p-3">
+        <div class="flex items-center justify-between">
+          <p class="text-sm font-semibold text-ink">${fecha} · ${hora}</p>
+          <span class="text-lg font-bold text-ink">$${formatPrice(v.total || 0)}</span>
+        </div>
+        <ul class="mt-2 space-y-1 border-t border-ink/10 pt-2">${lineas}</ul>
+      </li>`;
+    })
+    .join("");
+
+  $("#fiados-purchases").querySelectorAll("[data-annul-abono]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const ts = parseInt(el.dataset.annulAbono, 10);
+      const abono = todayAbonos.find((a) => a.ts === ts);
+      if (abono) annulAbono(abono);
+    })
+  );
+}
+
+// ── Anular abono (solo del día; con confirmación) ──
+async function annulAbono(abono) {
+  const ok = await showConfirm({
+    title: "Anular abono",
+    message: `Se anulará el abono de $${formatPrice(abono.monto || 0)} de ${abono.fiadoNombre} y la deuda volverá a subir.`,
+    confirmLabel: "Anular",
+    danger: true,
+  });
+  if (!ok) return;
+
+  // Local
+  todayAbonos = todayAbonos.filter((a) => a.ts !== abono.ts);
+  await localDB.replaceAbonos(todayAbonos);
+
+  // Nube: si aún estaba en cola, basta con sacarlo; si ya subió, se revierte.
+  const pending = await localDB.getOutbox();
+  const queued = pending.find(
+    (op) => op.type === "abono" && op.payload?.abono?.ts === abono.ts
+  );
+  if (queued) {
+    await localDB.deleteFromOutbox(queued.id);
+  } else {
+    await localDB.addToOutbox({ uid: currentUser.uid, type: "abonoRevert", payload: { abono } });
+    scheduleFlush();
+  }
+
+  await applyFiadoDeltaLocal(abono.fiadoId, abono.monto || 0);
+  showToast("Abono anulado", "success");
+  if (selectedFiado) openFiadoDetail(selectedFiado);
+}
+
+// ── Saldar deuda (abono total o parcial) ──
+let abonoMethod = "efectivo";
+
+function openAbonoModal() {
+  if (!selectedFiado || selectedFiadoSaldo <= 0) return;
+  abonoMethod = "efectivo";
+  $("#ab-person").textContent =
+    `${selectedFiado.nombre} debe $${formatPrice(selectedFiadoSaldo)}.`;
+  $("#ab-monto").value = "";
+  $("#ab-monto").max = selectedFiadoSaldo;
+  renderAbonoMethods();
+  openModal("abono-modal");
+  setTimeout(() => $("#ab-monto").focus(), 50);
+}
+
+function renderAbonoMethods() {
+  const wrap = $("#ab-methods");
+  wrap.innerHTML = PAYMENT_METHODS.filter((m) => m.id !== "fiado")
+    .map((m) => {
+      const active = abonoMethod === m.id;
+      const cls = active
+        ? "border-brand bg-brand text-white"
+        : "border-ink/15 bg-white text-ink/80 hover:bg-paper";
+      return `<button data-ab-method="${m.id}" class="rounded-xl border px-3 py-2.5 text-sm font-semibold transition active:scale-[0.98] ${cls}">${m.label}</button>`;
+    })
+    .join("");
+  wrap.querySelectorAll("[data-ab-method]").forEach((el) =>
+    el.addEventListener("click", () => {
+      abonoMethod = el.dataset.abMethod;
+      renderAbonoMethods();
+    })
+  );
+}
+
+async function confirmAbono() {
+  if (!selectedFiado) return;
+  const monto = parseFloat($("#ab-monto").value) || 0;
+  if (monto <= 0) { showToast("Ingresá un monto válido", "error"); return; }
+  if (monto > selectedFiadoSaldo) {
+    showToast(`El abono no puede superar la deuda ($${formatPrice(selectedFiadoSaldo)})`, "error");
+    return;
+  }
+
+  const abono = {
+    fiadoId: selectedFiado.id,
+    fiadoNombre: selectedFiado.nombre,
+    monto,
+    metodoPago: abonoMethod,
+    ts: Date.now(),
+  };
+
+  // Local al instante + cola a la nube
+  todayAbonos.unshift(abono);
+  await localDB.addAbono(abono);
+  await localDB.addToOutbox({ uid: currentUser.uid, type: "abono", payload: { abono } });
+  scheduleFlush();
+  await applyFiadoDeltaLocal(abono.fiadoId, -monto, abono.ts);
+
+  closeModal("abono-modal");
+  renderReports();
+  const saldado = monto >= selectedFiadoSaldo;
+  showToast(
+    saldado
+      ? `${selectedFiado.nombre} saldó su deuda ✓`
+      : `Abono de $${formatPrice(monto)} registrado a ${selectedFiado.nombre}`,
+    "success"
+  );
+  openFiadoDetail(selectedFiado);
+}
+
+// ── Cuaderno: crear persona y anotar fiados manuales ──
+async function createFiadoFromModule() {
+  const fiador = await registerFiador($("#fiados-search").value);
+  if (!fiador) return;
+  $("#fiados-search").value = "";
+  renderFiadosPeople();
+  openFiadoDetail(fiador);
+}
+
+function openFiadoEntry() {
+  if (!selectedFiado) return;
+  feLines = [];
+  $("#fe-person").textContent = `Cuenta de ${selectedFiado.nombre}`;
+  $("#fe-search").value = "";
+  $("#fe-detalle").value = "";
+  $("#fe-valor").value = "";
+  $("#fe-results").classList.add("hidden");
+  renderFeLines();
+  openModal("fiado-entry-modal");
+  setTimeout(() => $("#fe-search").focus(), 50);
+}
+
+// ── Líneas de la anotación en curso ──
+// Producto de inventario → descuenta stock al guardar.
+// Línea libre → texto y valor sin control de stock.
+let feLines = [];
+
+function feTotal() {
+  return feLines.reduce((s, l) => s + (l.precio || 0) * (l.cantidad || 0), 0);
+}
+
+let feSearchIndex = -1; // ítem resaltado con las flechas en el modal de fiado
+
+function renderFeResults() {
+  const box = $("#fe-results");
+  const term = $("#fe-search").value.trim();
+  feSearchIndex = -1; // el texto cambió: se pierde la selección
+  if (term.length < 2) {
+    box.classList.add("hidden");
+    return;
+  }
+  // Pesables excluidos: sus precios se calculan por gramos en la caja
+  const matches = rankProducts(term, products.filter((p) => !p.pesable)).slice(0, 8);
+  if (matches.length === 0) {
+    box.classList.add("hidden");
+    return;
+  }
+  box.innerHTML = matches
+    .map((p) => {
+      const sinStock = (p.cantidad ?? 0) <= 0;
+      return `
+      <li>
+        <button data-fe-add="${escapeHtml(p.codigo)}" ${sinStock ? "disabled" : ""}
+          class="flex w-full items-center justify-between gap-2 px-3 py-2.5 text-left text-sm transition hover:bg-paper disabled:opacity-40">
+          <span class="min-w-0 flex-1 truncate font-medium text-ink">${escapeHtml(p.nombre || p.codigo)}</span>
+          <span class="shrink-0 text-xs text-ink/40">${sinStock ? "Sin stock" : `Stock: ${p.cantidad}`}</span>
+          <span class="shrink-0 font-semibold text-ink">$${formatPrice(p.precioVenta)}</span>
+        </button>
+      </li>`;
+    })
+    .join("");
+  box.classList.remove("hidden");
+  box.querySelectorAll("[data-fe-add]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const p = products.find((x) => x.codigo === el.dataset.feAdd);
+      if (p) feAddProduct(p);
+    })
+  );
+}
+
+function feAddProduct(p) {
+  const existing = feLines.find((l) => !l.manual && l.codigo === p.codigo);
+  const enLinea = existing ? existing.cantidad : 0;
+  if (enLinea + 1 > (p.cantidad ?? 0)) {
+    showToast("Sin stock suficiente", "error");
+    return;
+  }
+  if (existing) existing.cantidad++;
+  else {
+    feLines.push({
+      codigo: p.codigo,
+      nombre: p.nombre || p.codigo,
+      precio: p.precioVenta || 0,
+      cantidad: 1,
+      manual: false,
+    });
+  }
+  $("#fe-search").value = "";
+  $("#fe-results").classList.add("hidden");
+  renderFeLines();
+  $("#fe-search").focus();
+}
+
+function feAddFreeLine() {
+  const detalle = $("#fe-detalle").value.trim();
+  const valor = parseFloat($("#fe-valor").value) || 0;
+  if (!detalle) { showToast("Ingresá qué llevó", "error"); return; }
+  if (valor <= 0) { showToast("Ingresá un valor válido", "error"); return; }
+  feLines.push({
+    codigo: `manual-${Date.now()}`,
+    nombre: detalle,
+    precio: valor,
+    cantidad: 1,
+    manual: true,
+  });
+  $("#fe-detalle").value = "";
+  $("#fe-valor").value = "";
+  renderFeLines();
+}
+
+function renderFeLines() {
+  const list = $("#fe-lines");
+  $("#fe-total").textContent = "$" + formatPrice(feTotal());
+  list.innerHTML = feLines
+    .map((l, i) => {
+      const middle = l.manual
+        ? `<span class="shrink-0 text-sm font-bold text-ink">$${formatPrice(l.precio)}</span>`
+        : `<div class="flex shrink-0 items-center gap-1.5">
+             <button data-fe-dec="${i}" class="flex h-7 w-7 items-center justify-center rounded-lg bg-ink/10 font-bold text-ink active:scale-95">−</button>
+             <span class="w-5 text-center text-sm font-bold text-ink">${l.cantidad}</span>
+             <button data-fe-inc="${i}" class="flex h-7 w-7 items-center justify-center rounded-lg bg-ink/10 font-bold text-ink active:scale-95">+</button>
+           </div>
+           <span class="w-16 shrink-0 text-right text-sm font-bold text-ink">$${formatPrice(l.precio * l.cantidad)}</span>`;
+      return `
+      <li class="flex items-center gap-2 rounded-xl border border-ink/10 bg-paper p-2">
+        <div class="min-w-0 flex-1">
+          <p class="truncate text-sm font-semibold text-ink">${escapeHtml(l.nombre)}</p>
+          <p class="text-[11px] text-ink/40">${l.manual ? "Línea libre" : "Descuenta stock"}</p>
+        </div>
+        ${middle}
+        <button data-fe-del="${i}" aria-label="Quitar" class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-ink/40 transition hover:bg-ink/5 hover:text-ink">
+          <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </li>`;
+    })
+    .join("");
+
+  list.querySelectorAll("[data-fe-inc]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const l = feLines[parseInt(el.dataset.feInc, 10)];
+      if (l.cantidad + 1 > stockOf(l.codigo)) {
+        showToast("Sin stock suficiente", "error");
+        return;
+      }
+      l.cantidad++;
+      renderFeLines();
+    })
+  );
+  list.querySelectorAll("[data-fe-dec]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const l = feLines[parseInt(el.dataset.feDec, 10)];
+      if (l.cantidad > 1) { l.cantidad--; renderFeLines(); }
+    })
+  );
+  list.querySelectorAll("[data-fe-del]").forEach((el) =>
+    el.addEventListener("click", () => {
+      feLines.splice(parseInt(el.dataset.feDel, 10), 1);
+      renderFeLines();
+    })
+  );
+}
+
+async function confirmFiadoEntry() {
+  if (!selectedFiado) return;
+
+  // Si quedó texto en la línea libre sin agregar, se agrega automáticamente
+  if ($("#fe-detalle").value.trim() && (parseFloat($("#fe-valor").value) || 0) > 0) {
+    feAddFreeLine();
+  }
+  if (feLines.length === 0) {
+    showToast("Agregá al menos un producto o una línea libre", "error");
+    return;
+  }
+
+  // Validación final de stock (pudo cambiar mientras el modal estaba abierto)
+  for (const l of feLines) {
+    if (!l.manual && l.cantidad > stockOf(l.codigo)) {
+      showToast(`Sin stock suficiente de ${l.nombre}`, "error");
+      return;
+    }
+  }
+
+  // Cupo de crédito: bloquea si la anotación deja la deuda sobre el límite
+  {
+    const f = fiadores.find((x) => x.id === selectedFiado.id) || selectedFiado;
+    const err = cupoError(f, feTotal());
+    if (err) {
+      showToast(err, "error");
+      return;
+    }
+  }
+
+  const ts = Date.now();
+  const sale = {
+    items: feLines.map((l) => ({
+      codigo: l.codigo,
+      nombre: l.nombre,
+      precio: l.precio,
+      cantidad: l.cantidad,
+      pesable: false,
+      manual: !!l.manual,
+      gramos: 0,
+      codigoBase: null,
+      nombreBase: null,
+    })),
+    total: feTotal(),
+    metodoPago: "fiado",
+    fiadoId: selectedFiado.id,
+    fiadoNombre: selectedFiado.nombre,
+    ts,
+  };
+
+  // Mismo camino que la caja: descuenta stock, movimientos, local y nube
+  await persistSale(sale);
+
+  closeModal("fiado-entry-modal");
+  feLines = [];
+  showToast(`Fiado de $${formatPrice(sale.total)} anotado a ${selectedFiado.nombre}`, "success");
+  openFiadoDetail(selectedFiado);
 }
 
 async function onSalesDayChange() {
@@ -903,6 +1886,8 @@ function openSaleEdit(sale) {
   editingSale = {
     ts: sale.ts,
     metodoPago: sale.metodoPago,
+    fiadoId: sale.fiadoId || null,
+    fiadoNombre: sale.fiadoNombre || null,
     items: (sale.items || []).map((it) => ({ ...it })),
   };
   const hora = new Date(sale.ts || Date.now()).toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" });
@@ -984,12 +1969,18 @@ function renderSaleEdit() {
 
   // Métodos de pago
   const wrap = $("#se-methods");
-  wrap.innerHTML = PAYMENT_METHODS.map((m) => {
+  // "Fiado" solo se ofrece si la venta ya era fiada (cambiar HACIA fiado
+  // requeriría elegir persona; se hace anulando y cobrando de nuevo).
+  const methods = PAYMENT_METHODS.filter(
+    (m) => m.id !== "fiado" || editingSale.fiadoId
+  );
+  wrap.innerHTML = methods.map((m) => {
     const active = editingSale.metodoPago === m.id;
     const cls = active
       ? "border-brand bg-brand text-white"
       : "border-ink/15 bg-white text-ink/80 hover:bg-paper";
-    return `<button data-se-method="${m.id}" class="rounded-xl border px-3 py-2.5 text-sm font-semibold transition active:scale-[0.98] ${cls}">${m.label}</button>`;
+    const label = m.id === "fiado" ? `Fiado (${escapeHtml(editingSale.fiadoNombre || "")})` : m.label;
+    return `<button data-se-method="${m.id}" class="rounded-xl border px-3 py-2.5 text-sm font-semibold transition active:scale-[0.98] ${cls}">${label}</button>`;
   }).join("");
   wrap.querySelectorAll("[data-se-method]").forEach((el) =>
     el.addEventListener("click", () => {
@@ -1021,6 +2012,15 @@ async function saveSaleEdit() {
 
   const newItems = editingSale.items.map((it) => ({ ...it }));
   const newTotal = newItems.reduce((s, it) => s + (it.precio || 0) * (it.cantidad || 0), 0);
+
+  // Ajuste de la deuda del fiador: si era fiada, la deuda cambia con el total
+  // (o desaparece si se cambió el método de pago).
+  const origFiadoId = orig.fiadoId || null;
+  const origTotal = orig.total || 0;
+  const sigueFiado = editingSale.metodoPago === "fiado";
+  const fiadoDelta = origFiadoId
+    ? { fiadoId: origFiadoId, delta: sigueFiado ? newTotal - origTotal : -origTotal }
+    : null;
 
   // Deltas de stock solo para productos con control de stock:
   // positivo = devolver al stock, negativo = descontar más.
@@ -1058,6 +2058,8 @@ async function saveSaleEdit() {
   orig.items = newItems;
   orig.total = newTotal;
   orig.metodoPago = editingSale.metodoPago;
+  orig.fiadoId = editingSale.metodoPago === "fiado" ? editingSale.fiadoId : null;
+  orig.fiadoNombre = editingSale.metodoPago === "fiado" ? editingSale.fiadoNombre : null;
   await localDB.replaceSales(todaySales);
 
   // 3) Nube: si sigue en la cola, se reemplaza el commit pendiente por el
@@ -1067,16 +2069,21 @@ async function saveSaleEdit() {
     (op) => op.type === "sale" && op.payload?.sale?.ts === orig.ts
   );
   if (queued) {
+    // El commit pendiente se reemplaza: al subir aplicará el saldo correcto.
     await localDB.deleteFromOutbox(queued.id);
     await localDB.addToOutbox({ uid: currentUser.uid, type: "sale", payload: { sale: { ...orig } } });
   } else {
     await localDB.addToOutbox({
       uid: currentUser.uid,
       type: "updateSale",
-      payload: { sale: { ...orig }, deltas },
+      payload: { sale: { ...orig }, deltas, fiadoDelta },
     });
   }
   scheduleFlush();
+
+  if (fiadoDelta && fiadoDelta.delta) {
+    await applyFiadoDeltaLocal(fiadoDelta.fiadoId, fiadoDelta.delta);
+  }
 
   closeModal("sale-edit-modal");
   editingSale = null;
@@ -1132,12 +2139,48 @@ async function posCharge() {
     codigoBase: c.codigoBase || null,
     nombreBase: c.nombreBase || null,
   }));
+  if (posMethod === "fiado" && !posFiado) {
+    showToast("Elegí a quién se le fía", "error");
+    openFiadoModal();
+    return;
+  }
+
   const total = cartTotal();
-  const sale = { items, total, metodoPago: posMethod, ts: Date.now() };
+
+  // Cupo de crédito: bloquea si la venta deja la deuda por encima del límite
+  if (posMethod === "fiado" && posFiado) {
+    const f = fiadores.find((x) => x.id === posFiado.id) || posFiado;
+    const err = cupoError(f, total);
+    if (err) {
+      showToast(err, "error");
+      return;
+    }
+  }
+  const sale = {
+    items,
+    total,
+    metodoPago: posMethod,
+    fiadoId: posMethod === "fiado" ? posFiado.id : null,
+    fiadoNombre: posMethod === "fiado" ? posFiado.nombre : null,
+    ts: Date.now(),
+  };
   const metodoLabel = PAYMENT_METHODS.find((m) => m.id === posMethod)?.label || posMethod;
 
-  // 1) Actualiza el dispositivo al instante: stock, movimientos y venta.
-  for (const it of items) {
+  await persistSale(sale);
+
+  posClear();
+  focusPosInput();
+
+  showToast(
+    `Venta cobrada · ${metodoLabel} · $${formatPrice(total)}`,
+    "success"
+  );
+}
+
+// Persiste una venta (de caja o del cuaderno de fiados): descuenta stock,
+// registra movimientos, guarda local, encola a la nube y refresca la UI.
+async function persistSale(sale) {
+  for (const it of sale.items) {
     if (!it.pesable && !it.manual) {
       const idx = products.findIndex((p) => p.codigo === it.codigo);
       if (idx >= 0) {
@@ -1161,21 +2204,15 @@ async function posCharge() {
   todaySales.unshift(sale);
   await localDB.addSale(sale);
 
-  posClear();
+  await localDB.addToOutbox({ uid: currentUser.uid, type: "sale", payload: { sale } });
+  scheduleFlush();
+
+  if (sale.fiadoId) await applyFiadoDeltaLocal(sale.fiadoId, sale.total || 0, sale.ts);
+
   renderInventory();
   renderReports();
   renderSales();
   renderHistory(todayMovements);
-  focusPosInput();
-
-  // 2) Encola la venta completa y programa la subida (debounce).
-  await localDB.addToOutbox({ uid: currentUser.uid, type: "sale", payload: { sale } });
-  scheduleFlush();
-
-  showToast(
-    `Venta cobrada · ${metodoLabel} · $${formatPrice(total)}`,
-    "success"
-  );
 }
 
 // ============================================================
@@ -1394,12 +2431,9 @@ function isLowStock(p) {
 function renderInventory() {
   const term = $("#inventory-search").value.trim().toLowerCase();
   const list = $("#inventory-list");
-  let filtered = products.filter(
-    (p) =>
-      !term ||
-      (p.nombre || "").toLowerCase().includes(term) ||
-      (p.codigo || "").includes(term)
-  );
+  // Con término: ordenado por relevancia (empieza con > palabra > contiene).
+  // Sin término: orden alfabético original.
+  let filtered = term ? rankProducts(term, products) : [...products];
   if (inventoryFilter === "low") filtered = filtered.filter(isLowStock);
 
   // Contador rojo en el botón "Bajo stock"
@@ -1558,6 +2592,43 @@ function renderReports() {
           <p class="text-xs text-ink/40">${d.count} ${d.count === 1 ? "venta" : "ventas"}</p>
         </div>
         <span class="text-lg font-bold text-ink">$${formatPrice(d.total)}</span>
+      </li>`;
+    })
+    .join("");
+
+  // --- Fiados (hoy): fiado nuevo y abonos recibidos ---
+  const fiadoSales = todaySales.filter((v) => v.metodoPago === "fiado");
+  const fiadoTotal = fiadoSales.reduce((s, v) => s + (v.total || 0), 0);
+  $("#rep-fiado-total").textContent = "$" + formatPrice(fiadoTotal);
+  $("#rep-fiado-count").textContent =
+    fiadoSales.length === 0 ? "Sin fiados hoy" : `${fiadoSales.length} ${fiadoSales.length === 1 ? "venta fiada" : "ventas fiadas"}`;
+
+  const abonosTotal = todayAbonos.reduce((s, a) => s + (a.monto || 0), 0);
+  $("#rep-abonos-total").textContent = "$" + formatPrice(abonosTotal);
+  $("#rep-abonos-count").textContent =
+    todayAbonos.length === 0 ? "Sin abonos hoy" : `${todayAbonos.length} ${todayAbonos.length === 1 ? "abono" : "abonos"}`;
+
+  const conSaldo = fiadores.filter((f) => (f.saldo ?? 0) > 0);
+  const porCobrar = conSaldo.reduce((sum, f) => sum + f.saldo, 0);
+  const sinCalcular = fiadores.filter((f) => f.saldo == null).length;
+  $("#rep-por-cobrar").textContent = "$" + formatPrice(porCobrar);
+  $("#rep-por-cobrar-count").textContent =
+    (conSaldo.length === 0
+      ? "Nadie debe"
+      : `${conSaldo.length} ${conSaldo.length === 1 ? "persona debe" : "personas deben"}`) +
+    (sinCalcular > 0 ? ` · ${sinCalcular} sin calcular` : "");
+
+  $("#rep-abonos").innerHTML = todayAbonos
+    .map((a) => {
+      const hora = new Date(a.ts || Date.now()).toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" });
+      const metodo = PAYMENT_METHODS.find((m) => m.id === a.metodoPago)?.label || a.metodoPago;
+      return `
+      <li class="flex items-center justify-between rounded-2xl bg-white p-3 shadow-sm ring-1 ring-ink/10">
+        <div class="min-w-0">
+          <p class="truncate font-medium text-ink">${escapeHtml(a.fiadoNombre || "")}</p>
+          <p class="text-xs text-ink/40">${hora} · ${metodo}</p>
+        </div>
+        <span class="text-lg font-bold text-ink">$${formatPrice(a.monto || 0)}</span>
       </li>`;
     })
     .join("");
@@ -1756,6 +2827,44 @@ function excelReady() {
 }
 
 // Inventario actual → planilla con stock y valorización.
+function exportFiadosXlsx() {
+  if (!excelReady()) return;
+  if (!fiadores.length) {
+    showToast("No hay personas registradas para exportar", "error");
+    return;
+  }
+  const rows = fiadores.map((f) => {
+    const saldo = f.saldo;
+    const estado =
+      saldo == null ? "Sin calcular" : saldo > 0 ? "Debe" : saldo < 0 ? "A favor" : "Al día";
+    const cupo = cupoOf(f);
+    const disp = cupoDisponible(f);
+    return {
+      "Persona": f.nombre,
+      "Saldo": saldo == null ? "" : saldo,
+      "Estado": estado,
+      "Cupo": cupo == null ? "Sin límite" : cupo,
+      "Cupo disponible": disp == null ? "" : Math.max(0, disp),
+      "Último movimiento": f.ultimoMovimiento
+        ? new Date(f.ultimoMovimiento).toLocaleDateString("es")
+        : "",
+    };
+  });
+  // Los que más deben, primero
+  rows.sort((a, b) => (Number(b["Saldo"]) || 0) - (Number(a["Saldo"]) || 0));
+  const totalRow = {
+    "Persona": "TOTAL POR COBRAR",
+    "Saldo": fiadores.reduce((sum, f) => sum + Math.max(0, f.saldo ?? 0), 0),
+    "Estado": "",
+    "Último movimiento": "",
+  };
+  const ws = XLSX.utils.json_to_sheet([...rows, totalRow]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Fiados");
+  XLSX.writeFile(wb, `fiados-${new Date().toISOString().slice(0, 10)}.xlsx`);
+  showToast("Cuaderno de fiados exportado", "success");
+}
+
 function exportInventoryXlsx() {
   if (!excelReady()) return;
   if (!products.length) {
@@ -1989,12 +3098,23 @@ async function renderStats() {
   const start = new Date(); start.setDate(start.getDate() - statsperiodDays + 1); start.setHours(0,0,0,0);
 
   let sales = [];
+  let periodAbonos = [];
   try {
-    sales = await salesApi.fetchRange(currentUser.uid, start, end);
+    [sales, periodAbonos] = await Promise.all([
+      salesApi.fetchRange(currentUser.uid, start, end),
+      abonosApi.fetchRange(currentUser.uid, start, end).catch(() => []),
+    ]);
   } catch (e) {
     if (isQuotaError && isQuotaError(e)) showQuotaBanner();
     statsLoading = false;
     return;
+  }
+
+  const abonosEl = $("#stats-abonos");
+  if (abonosEl) {
+    const abTotal = periodAbonos.reduce((sum, a) => sum + (a.monto || 0), 0);
+    abonosEl.classList.toggle("hidden", periodAbonos.length === 0);
+    abonosEl.textContent = `Abonos de fiados en el período: $${formatPrice(abTotal)} (${periodAbonos.length} ${periodAbonos.length === 1 ? "abono" : "abonos"})`;
   }
 
   const empty = $("#stats-empty");
@@ -2184,8 +3304,41 @@ function bindEvents() {
     posInput.focus();
   };
   posInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); posAdd(); }
-    if (e.key === "Escape") { $("#pos-search-results").classList.add("hidden"); }
+    const results = $("#pos-search-results");
+    const open = !results.classList.contains("hidden");
+
+    if (open && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+      e.preventDefault();
+      posSearchIndex = moveListSelection(
+        results, "li[data-code]", posSearchIndex, e.key === "ArrowDown" ? 1 : -1
+      );
+      return;
+    }
+
+    if (e.key === "Enter") {
+      e.preventDefault();
+      // Si navegó con flechas, Enter elige ese producto.
+      // Sin selección, comportamiento clásico: agrega por código escaneado/tecleado
+      // (así el lector USB sigue funcionando igual).
+      if (open && posSearchIndex >= 0) {
+        const sel = results.querySelectorAll("li[data-code]")[posSearchIndex];
+        if (sel) {
+          results.classList.add("hidden");
+          posSearchIndex = -1;
+          posInput.value = "";
+          posAddByCode(sel.dataset.code);
+          posInput.focus();
+          return;
+        }
+      }
+      posAdd();
+      return;
+    }
+
+    if (e.key === "Escape") {
+      results.classList.add("hidden");
+      posSearchIndex = -1;
+    }
   });
   posInput.addEventListener("input", () => posPendingSearch(posInput.value.trim()));
   posInput.addEventListener("blur", () =>
@@ -2205,6 +3358,63 @@ function bindEvents() {
   $("#mi-precio").addEventListener("keydown", (e) => { if (e.key === "Enter") confirmManualItem(); });
   $("#se-save-btn").addEventListener("click", saveSaleEdit);
   $("#se-delete-btn").addEventListener("click", deleteSaleFromEdit);
+  $("#fiado-search").addEventListener("input", () => renderFiadoMatches($("#fiado-search").value));
+  $("#fiado-search").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !$("#fiado-create-btn").classList.contains("hidden")) createFiado();
+  });
+  $("#fiado-create-btn").addEventListener("click", createFiado);
+  $("#fiados-search").addEventListener("input", renderFiadosPeople);
+  $("#fiados-search").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !$("#fiados-create-btn").classList.contains("hidden")) createFiadoFromModule();
+  });
+  $("#fiados-create-btn").addEventListener("click", createFiadoFromModule);
+  $("#fiados-entry-btn").addEventListener("click", openFiadoEntry);
+  $("#fiados-pay-btn").addEventListener("click", openAbonoModal);
+  $("#fiados-delete-btn").addEventListener("click", deleteFiador);
+  $("#fiados-history-btn").addEventListener("click", loadFullFiadoHistory);
+  $("#fiados-cupo-btn").addEventListener("click", openCupoModal);
+  $("#cupo-save-btn").addEventListener("click", () => saveCupo(false));
+  $("#cupo-remove-btn").addEventListener("click", () => saveCupo(true));
+  $("#cupo-monto").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") saveCupo(false);
+  });
+  $("#fiados-export-btn").addEventListener("click", exportFiadosXlsx);
+  $("#ab-total-btn").addEventListener("click", () => { $("#ab-monto").value = selectedFiadoSaldo; });
+  $("#ab-save-btn").addEventListener("click", confirmAbono);
+  $("#ab-monto").addEventListener("keydown", (e) => { if (e.key === "Enter") confirmAbono(); });
+  $("#fe-save-btn").addEventListener("click", confirmFiadoEntry);
+  $("#fe-search").addEventListener("input", renderFeResults);
+  $("#fe-search").addEventListener("keydown", (e) => {
+    const box = $("#fe-results");
+    const open = !box.classList.contains("hidden");
+    if (!open) return;
+
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      feSearchIndex = moveListSelection(
+        box, "[data-fe-add]:not([disabled])", feSearchIndex, e.key === "ArrowDown" ? 1 : -1
+      );
+      return;
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      // Enter elige el resaltado; sin flechas, el primero disponible
+      const items = box.querySelectorAll("[data-fe-add]:not([disabled])");
+      const sel = feSearchIndex >= 0 ? items[feSearchIndex] : items[0];
+      if (sel) {
+        const p = products.find((x) => x.codigo === sel.dataset.feAdd);
+        if (p) feAddProduct(p);
+      }
+      feSearchIndex = -1;
+      return;
+    }
+    if (e.key === "Escape") {
+      box.classList.add("hidden");
+      feSearchIndex = -1;
+    }
+  });
+  $("#fe-add-line-btn").addEventListener("click", feAddFreeLine);
+  $("#fe-valor").addEventListener("keydown", (e) => { if (e.key === "Enter") feAddFreeLine(); });
 
   // Modal de confirmación genérico
   $("#confirm-accept-btn").addEventListener("click", () => resolveConfirm(true));
